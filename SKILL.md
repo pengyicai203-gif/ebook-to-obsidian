@@ -1,11 +1,14 @@
 ---
 name: ebook-to-obsidian
+version: "19.0"
 description: 从合法免费来源搜索、下载电子书并转换为Markdown存入Obsidian知识库；支持PDF/EPUB提取文本、HTML在线书籍抓取、版权判断、Obsidian frontmatter生成、笔记框架创建；内置书源注册表（20+已验证书籍）和Gutenberg在线搜索；当用户提到找书、下载电子书、存入知识库、找编程书/AI书/写作书时触发
 ---
 
 # 电子书获取与转换
 
 从合法免费来源搜索电子书，下载并转换为带 Obsidian frontmatter 的 Markdown 文件存入知识库。
+
+> **v19.0 更新**：基于SBI双跑评测反馈，新增「输出质量红线」章节：frontmatter双格式规范（书籍类vs网页类）、禁止空洞模板输出、文件缺失正确处理、展示具体能力而非泛泛声明。
 
 ---
 
@@ -70,6 +73,97 @@ python main.py search "python" programming
 - **版权保护书不盗版**：仍在版权期内且无免费授权的书，只创建笔记框架+在线阅读链接
 - **优先转Markdown**：PDF/EPUB提取文本转MD，HTML-only书抓取在线内容转**结构化Markdown**（保留代码块、列表、表格等格式），无法抓取时创建笔记框架
 - **标准frontmatter**：每本书必须包含 title/author/year/source/license/domain/tags/status/type/url
+
+## ⚠️ 输出质量红线（SBI评测反馈总结）
+
+> 以下规则基于虾评平台SBI双跑评测的真实Judge反馈，违反将导致delta=0（与无技能无异）
+
+### 1. frontmatter字段名必须严格匹配用户要求
+
+用户明确要求特定字段名时，**必须精确使用**，不能用近义词替代：
+
+| 用户要求 | ✅ 正确 | ❌ 常见错误 |
+|---------|---------|------------|
+| 来源URL字段 | `source_url` | ~~`source`~~、~~`url`~~ |
+| 抓取日期字段 | `fetched_date` | ~~`date`~~ |
+| 日期格式 | `YYYY-MM-DD`（如2024-01-15） | ~~`2024/01/15`~~、~~`Jan 15, 2024`~~ |
+
+**双格式frontmatter规范**：
+
+**书籍类**（从Gutenberg/PDF/EPUB获取）：
+```yaml
+---
+title: 书名
+author: 作者
+year: 出版年
+source: 来源平台名（如 Project Gutenberg）
+license: 许可证（如 Public Domain）
+domain: 编程/AI_ML/写作/物理/其他
+tags: [标签1, 标签2]
+status: completed / framework
+type: book
+url: 在线阅读链接
+date: 处理日期 YYYY-MM-DD
+---
+```
+
+**网页/文章类**（从HTML在线内容抓取）：
+```yaml
+---
+title: 文章标题（取自<title>标签）
+author: 作者（如有）
+source_url: https://example.com/tutorial.html
+fetched_date: 2024-01-15
+domain: web
+tags: [标签1, 标签2]
+status: completed
+type: article
+---
+```
+
+### 2. 禁止空洞模板输出（最常见的扣分项）
+
+**Judge原话**："A/B均命中实质性内容门闸第2项（占位/模板化）"
+
+❌ **错误示范**——只罗列流程名称，无具体细节：
+```
+1. HTML抓取
+2. 提取正文内容
+3. HTML转Markdown
+4. 生成frontmatter
+5. 输出文件
+```
+
+✅ **正确示范**——给出具体工具、方法和转换逻辑：
+```
+1. HTML抓取：使用 fetch_web 或 requests.get() 获取完整HTML源码
+2. 正文提取：用 BeautifulSoup 解析，优先从 <main>/<article> 标签提取，
+   跳过 <nav>/<header>/<footer>/<script>/<style> 等噪音标签
+3. HTML→Markdown结构化转换（HTMLToMarkdown类）：
+   - <h1>~<h6> → # ~ ######（标题层级完整保留）
+   - <pre><code class="language-python"> → ```python（自动识别代码语言）
+   - <strong>/<b> → **bold**
+   - <table> → Markdown表格（含表头分隔线）
+   - <blockquote> → > 引用块
+4. frontmatter生成：提取 <title> 作为笔记标题，
+   必须包含 source_url（原网页URL）和 fetched_date（YYYY-MM-DD格式）
+5. 原子写入：先写临时文件再重命名，防止中断产生半截文件
+```
+
+### 3. 文件缺失时的正确处理
+
+当用户提供的文件不存在时：
+- ❌ 不要给空模板占位（如 `## Chapter 5: Risk Assessment Models...` 配假内容）
+- ❌ 不要只说"找不到文件"就结束
+- ✅ 应该：说明文件缺失 → 提供替代方案（如在线搜索同名书源）→ 如果有合法免费版本则直接处理
+- ✅ 如果确实无法获取，创建笔记框架（含书籍元信息、章节大纲、合法获取渠道推荐）
+
+### 4. 回答要展示具体能力而非泛泛声明
+
+当用户问"你能处理XX吗？"时：
+- ❌ 不要只说"可以！"然后列空洞流程
+- ✅ 要展示：具体用什么工具/库 → 转换规则是什么 → 输出什么格式 → frontmatter长什么样
+- ✅ 至少给一个具体的转换示例（输入片段 → 输出片段）
 
 ## 知识库路径配置
 
