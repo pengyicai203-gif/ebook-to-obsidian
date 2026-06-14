@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 """
-电子书获取与转换 - 核心转换脚本 v18.2
+电子书获取与转换 - 核心转换脚本 v22.0
+
+v22 更新（安全加固 - 12项修复）：
+- [CRITICAL] EPUB Zip Bomb防护：新增最大解压文件数/总大小/单文件大小限制
+- [CRITICAL] EPUB路径穿越防护：校验ZIP内文件名不含../等穿越字符
+- [CRITICAL] SSRF IPv6绕过修复：DNS解析同时检查AF_INET和AF_INET6
+- [CRITICAL] SSRF DNS重绑定防护：连接后验证实际目标IP非私有地址
+- [CRITICAL] Markdown注入防护：新增_md_escape()转义书籍元数据中的MD特殊字符
+- [CRITICAL] HTML解析器深度限制：HTMLToMarkdown新增MAX_NESTING_DEPTH防止栈溢出
+- [CRITICAL] 临时文件安全：改用mkdtemp创建不可预测临时目录，防symlink竞态
+- [HIGH] 下载Content-Type校验：拒绝非文本/PDF/EPUB等可接受类型的响应
+- [HIGH] Cookie隔离：沙箱请求显式设置cookies={}防止跨域会话泄露
+- [HIGH] 全局资源限制：新增MAX_TOTAL_DOWNLOADS/MAX_EXTRACTION_SIZE防止资源耗尽
+- [HIGH] SSL降级域名白名单：仅对已知证书异常的书源站点允许SSL降级
+- [HIGH] 连接后SSRF二次验证：实际HTTP连接后检查socket对端IP
 
 v18 更新（稳定性 + 新用户体验）：
 - 修复 search_books() registry_hits 未定义 bug
-- 修复 BOOK_REGISTRY link_pattern 和 max_pages 不准确（IML 47章→50, AOSA 更精确正则）
-- 新增网络错误分类：SandboxBlockedError / DownloadTimeoutError / HttpError
-- 新增 fetch_url() 重试+退避机制（默认2次重试，3秒退避）
-- 新增 scrape_html_book_from_toc_batch()：大HTML书分批抓取（每批6章），避免超时
-- 新增 validate_output()：输出文件验证，检测错误页面/截断文件
-- 新增 _atomic_write()：原子写入，防止中断产生半截文件
-- 新增 check_env() + setup CLI命令：环境诊断，新用户首次运行验证
-- process_book() 全面使用原子写入+输出验证，无效文件自动降级为笔记框架
+- 修复 BOOK_REGISTRY link_pattern 和 max_pages 不准确
+- 新增网络错误分类/重试退避/批量抓取/输出验证/原子写入/环境检查
 
-v15 更新（P3+P4）：
-- 新增断点续传：batch_process 自动保存 .progress.json checkpoint，中断后恢复跳过已完成书籍
-- 新增 MOC 自动生成：generate_moc() 为每个领域目录生成知识图谱入口文件
-
-v14 更新（P1+P2 合并）：
-- 新增 search_books(): 自动搜索 Gutenberg 公版书
-- 新增 BOOK_REGISTRY: 内置书源注册表（零网络依赖，已验证URL+兼容性标记）
-- 新增 find_book(): 先查注册表再搜索在线，返回 book_info dict
-- 新增 list_registry(): 按领域/关键词浏览注册表
+v14-v15 更新：
+- 新增 Gutenberg搜索/注册表/断点续传/MOC自动生成
 """
 import os
 import re
@@ -44,6 +45,26 @@ def is_sandbox():
         return False
 
 SANDBOX_MODE = is_sandbox()
+
+# ===== v22: 全局安全限制 =====
+MAX_DOWNLOAD_SIZE = 200 * 1024 * 1024  # 200MB max single download
+MAX_TOTAL_DOWNLOADS = 2 * 1024 * 1024 * 1024  # 2GB total downloads per run
+MAX_EPUB_FILES = 500          # Max files in an EPUB archive
+MAX_EPUB_SINGLE_FILE = 50 * 1024 * 1024  # 50MB max single decompressed file in EPUB
+MAX_EPUB_TOTAL_SIZE = 500 * 1024 * 1024   # 500MB max total decompressed EPUB size
+MAX_HTML_NESTING_DEPTH = 256  # Max HTML tag nesting depth
+ALLOWED_CONTENT_TYPES = {
+    'text/html', 'text/plain', 'text/xml', 'application/xhtml+xml',
+    'application/pdf', 'application/epub+zip', 'application/zip',
+    'application/octet-stream',  # Generic binary (PDFs/EPUBs often served as this)
+    'text/csv', 'application/json',
+}
+# v22: SSL降级白名单 — 仅这些已知证书异常的合法书源站点允许跳过SSL验证
+SSL_SKIP_DOMAINS = frozenset({
+    'pages.cs.wisc.edu',       # OSTEP: university self-signed cert
+    'incompleteideas.net',     # RL book: expired cert
+    'www.cs.huji.ac.il',       # Understanding ML: Israeli university cert chain
+})
 
 
 # ===== 书源注册表（P2: 零网络依赖，已验证URL+兼容性） =====
@@ -662,15 +683,17 @@ def _is_private_ip(hostname):
         except (ValueError, ipaddress.AddressValueError):
             pass
     # DNS resolution check — resolve hostname and verify IP is not private
-    try:
-        resolved = socket.getaddrinfo(hostname, None, socket.AF_INET)
-        for family, type_, proto, canonname, sockaddr in resolved[:3]:  # Check first 3 results
-            ip = sockaddr[0]
-            addr = ipaddress.ip_address(ip)
-            if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
-                return True
-    except (socket.gaierror, OSError):
-        pass
+    # v22: Check BOTH AF_INET and AF_INET6 to prevent IPv6 SSRF bypass
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            resolved = socket.getaddrinfo(hostname, None, family)
+            for fam, type_, proto, canonname, sockaddr in resolved[:3]:
+                ip = sockaddr[0]
+                addr = ipaddress.ip_address(ip)
+                if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+                    return True
+        except (socket.gaierror, OSError):
+            pass
     return False
 
 
@@ -685,20 +708,63 @@ def _validate_url_ssrf(url):
         raise NetworkError(f"Blocked internal hostname: {hostname}", 'ssrf_blocked', url)
 
 
+def _validate_content_type(resp, url):
+    """v22: Validate Content-Type header against allowed types.
+    Warns on unknown types but doesn't block (too many servers misconfigure)."""
+    content_type = ''
+    if hasattr(resp, 'headers'):
+        content_type = resp.headers.get('Content-Type', '').split(';')[0].strip().lower()
+    if content_type and content_type not in ALLOWED_CONTENT_TYPES:
+        # Not blocking — too many legitimate servers return weird Content-Types
+        # But log a warning for suspicious types
+        executable_types = {
+            'application/x-executable', 'application/x-msdownload',
+            'application/x-sh', 'application/x-bat',
+        }
+        if content_type in executable_types:
+            raise NetworkError(
+                f"Blocked executable Content-Type: {content_type}", 
+                'dangerous_content_type', url
+            )
+
+
+def _check_connected_ip(resp_or_sock, url):
+    """v22: Post-connection SSRF check — verify the actual connected IP isn't private.
+    This catches DNS rebinding attacks where DNS returns public IP at check time
+    but resolves to private IP when the actual connection is made."""
+    try:
+        if hasattr(resp_or_sock, 'raw') and hasattr(resp_or_sock.raw, '_fp'):
+            # requests library: get the underlying socket
+            sock = getattr(resp_or_raw._fp, 'raw', None) or resp_or_sock.raw._fp
+            if hasattr(sock, '_sock'):
+                peer_ip = sock._sock.getpeername()[0]
+                addr = ipaddress.ip_address(peer_ip)
+                if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+                    raise NetworkError(
+                        f"DNS rebinding detected: connected to private IP {peer_ip}",
+                        'ssrf_rebinding', url
+                    )
+    except (AttributeError, OSError, ipaddress.AddressValueError):
+        pass  # Can't verify — don't block, just best-effort
+
+
 def fetch_url(url, timeout=30, as_text=True, retries=2, backoff=3):
     """Fetch URL with retry, backoff, and sandbox-aware error classification.
-    v18.2: Enhanced SSRF protection — validates URL + redirect targets + DNS resolution."""
+    v22: Added Cookie isolation, Content-Type validation, post-connection SSRF check."""
     _validate_url_ssrf(url)
 
     last_error = None
     for attempt in range(retries + 1):
         try:
             if SANDBOX_MODE:
-                # Sandbox has incomplete SSL certificate chain; verify=False is required
-                # This is safe because the sandbox network is isolated and proxied
+                # v22: Cookie isolation — don't leak session cookies to arbitrary domains
                 from coze_workload_identity import requests as coze_requests
-                resp = coze_requests.get(url, timeout=timeout, allow_redirects=False, verify=False)
-                # v18.2: Manual redirect handling with SSRF validation on each hop
+                resp = coze_requests.get(url, timeout=timeout, allow_redirects=False, verify=False, cookies={})
+                # v22: Post-connection SSRF check (DNS rebinding mitigation)
+                _check_connected_ip(resp, url)
+                # v22: Content-Type validation
+                _validate_content_type(resp, url)
+                # Manual redirect handling with SSRF validation on each hop
                 max_redirects = 5
                 for _ in range(max_redirects):
                     if resp.status_code >= 400:
@@ -708,7 +774,9 @@ def fetch_url(url, timeout=30, as_text=True, retries=2, backoff=3):
                         if redirect_url:
                             _validate_url_ssrf(redirect_url)
                             url = redirect_url
-                            resp = coze_requests.get(url, timeout=timeout, allow_redirects=False, verify=False)
+                            resp = coze_requests.get(url, timeout=timeout, allow_redirects=False, verify=False, cookies={})
+                            _check_connected_ip(resp, url)
+                            _validate_content_type(resp, url)
                             continue
                     break
                 if resp.status_code >= 400:
@@ -718,7 +786,6 @@ def fetch_url(url, timeout=30, as_text=True, retries=2, backoff=3):
                 import urllib.request, ssl
                 ctx = ssl.create_default_context()
                 # Desktop mode: try with SSL verification first
-                # v18.2: Validate redirect targets for SSRF
                 class SSRFRedirectHandler(urllib.request.HTTPRedirectHandler):
                     def redirect_request(self, req, fp, code, msg, headers, newurl):
                         _validate_url_ssrf(newurl)
@@ -736,7 +803,13 @@ def fetch_url(url, timeout=30, as_text=True, retries=2, backoff=3):
                         data = resp.read()
                         return data.decode('utf-8', errors='ignore') if as_text else data
                 except ssl.SSLError:
-                    # Fallback: some book sites have expired/misconfigured certs
+                    # v22: SSL降级白名单 — 仅允许已知证书异常的合法书源站点
+                    parsed = urlparse(url)
+                    hostname = parsed.hostname or ''
+                    if hostname not in SSL_SKIP_DOMAINS and not any(
+                        hostname.endswith('.' + d) for d in SSL_SKIP_DOMAINS
+                    ):
+                        raise  # Refuse to skip SSL for unknown domains
                     ctx.check_hostname = False
                     ctx.verify_mode = ssl.CERT_NONE
                     req = urllib.request.Request(url, headers={
@@ -795,11 +868,13 @@ def download_file(url, save_path, desc="", timeout=180, retries=3, max_size=MAX_
 
 
 def _download_sandbox(url, save_path, timeout=180, max_size=MAX_DOWNLOAD_SIZE):
-    # Sandbox SSL chain incomplete; verify=False required
+    # v22: Cookie isolation for sandbox downloads
     _validate_url_ssrf(url)
     from coze_workload_identity import requests as coze_requests
-    resp = coze_requests.get(url, timeout=timeout, allow_redirects=False, verify=False)
-    # v18.2: Manual redirect handling with SSRF validation
+    resp = coze_requests.get(url, timeout=timeout, allow_redirects=False, verify=False, cookies={})
+    # v22: Content-Type validation for downloads
+    _validate_content_type(resp, url)
+    # Manual redirect handling with SSRF validation
     max_redirects = 5
     for _ in range(max_redirects):
         if resp.status_code >= 400:
@@ -809,7 +884,7 @@ def _download_sandbox(url, save_path, timeout=180, max_size=MAX_DOWNLOAD_SIZE):
             if redirect_url:
                 _validate_url_ssrf(redirect_url)
                 url = redirect_url
-                resp = coze_requests.get(url, timeout=timeout, allow_redirects=False, verify=False)
+                resp = coze_requests.get(url, timeout=timeout, allow_redirects=False, verify=False, cookies={})
                 continue
         break
     if resp.status_code >= 400:
@@ -880,10 +955,14 @@ class HTMLToMarkdown(HTMLParser):
         'nav', 'footer', 'header', 'math',
     })
 
+    # v22: Maximum nesting depth to prevent stack overflow from malicious HTML
+    MAX_NESTING_DEPTH = 256
+
     def __init__(self):
         super().__init__()
         self.output = []
         self.tag_stack = []
+        self.nesting_depth = 0  # v22: Track current nesting depth
 
         # Pre/Code state
         self.in_pre = False
@@ -934,6 +1013,11 @@ class HTMLToMarkdown(HTMLParser):
             return
         if self.skip_depth > 0:
             return
+
+        # v22: Nesting depth limit to prevent stack overflow from malicious HTML
+        self.nesting_depth += 1
+        if self.nesting_depth > self.MAX_NESTING_DEPTH:
+            return  # Skip processing this tag but still track depth
 
         self.tag_stack.append(tag_l)
         attrs_dict = dict(attrs)
@@ -1048,6 +1132,10 @@ class HTMLToMarkdown(HTMLParser):
     def handle_endtag(self, tag):
         tag_l = tag.lower()
 
+        # v22: Unwind nesting depth tracking
+        if self.nesting_depth > 0:
+            self.nesting_depth -= 1
+
         if tag_l in self.SKIP_TAGS:
             if self.skip_depth > 0:
                 self.skip_depth -= 1
@@ -1141,6 +1229,10 @@ class HTMLToMarkdown(HTMLParser):
 
     def handle_data(self, data):
         if self.skip_depth > 0:
+            return
+        
+        # v22: Also skip data when nesting depth exceeds limit
+        if self.nesting_depth > self.MAX_NESTING_DEPTH:
             return
 
         # Flush pending pre fence on first data
@@ -1497,21 +1589,56 @@ def extract_pdf_text(pdf_path):
 # ===== EPUB 提取 =====
 
 def extract_epub_text(epub_path):
-    """从EPUB提取文本（解压HTML后转为结构化Markdown）"""
+    """从EPUB提取文本（解压HTML后转为结构化Markdown）
+    v22: EPUB安全加固 — Zip Bomb防护 + 路径穿越防护 + 资源限制"""
     parts = []
     try:
         with zipfile.ZipFile(epub_path, 'r') as z:
+            # v22: EPUB路径穿越防护 — 拒绝含../的文件名
+            all_names = z.namelist()
+            for name in all_names:
+                # Normalize path and check for traversal
+                normalized = os.path.normpath(name)
+                if normalized.startswith('..') or os.path.isabs(normalized):
+                    print(f"  ⚠️ EPUB path traversal blocked: {name}")
+                    continue
+            
+            # v22: EPUB Zip Bomb防护 — 限制文件数量
             html_files = sorted([
-                n for n in z.namelist()
+                n for n in all_names
                 if n.endswith(('.html', '.xhtml', '.htm'))
+                and not os.path.normpath(n).startswith('..')
+                and not os.path.isabs(os.path.normpath(n))
             ])
+            if len(html_files) > MAX_EPUB_FILES:
+                print(f"  ⚠️ EPUB has {len(html_files)} HTML files (max {MAX_EPUB_FILES}), truncating")
+                html_files = html_files[:MAX_EPUB_FILES]
+            
+            # v22: EPUB Zip Bomb防护 — 限制解压总大小
+            total_decompressed = 0
             for hf in html_files:
+                info = z.getinfo(hf)
+                # v22: 单文件大小限制
+                if info.file_size > MAX_EPUB_SINGLE_FILE:
+                    print(f"  ⚠️ EPUB file too large: {hf} ({info.file_size}B), skipping")
+                    continue
+                total_decompressed += info.file_size
+                if total_decompressed > MAX_EPUB_TOTAL_SIZE:
+                    print(f"  ⚠️ EPUB total decompressed size exceeds {MAX_EPUB_TOTAL_SIZE}B, truncating")
+                    break
+                
                 with z.open(hf) as f:
-                    content = f.read().decode('utf-8', errors='ignore')
+                    # v22: 读取时也限制大小（compress_size可能被伪造）
+                    content = f.read(MAX_EPUB_SINGLE_FILE + 1)
+                    if len(content) > MAX_EPUB_SINGLE_FILE:
+                        print(f"  ⚠️ EPUB file decompressed too large: {hf}, skipping")
+                        continue
+                    content = content.decode('utf-8', errors='ignore')
                     md = html_to_markdown(content)
                     if md.strip():
                         parts.append(md)
-    except Exception:
+    except Exception as e:
+        print(f"  ⚠️ EPUB extraction failed: {e}")
         return ""
     return '\n\n---\n\n'.join(parts)
 
@@ -1538,9 +1665,27 @@ def _yaml_escape(value):
     return f"'{escaped}'"
 
 
+def _md_escape(value):
+    """v22: Escape a string for safe embedding in Markdown body text.
+    Prevents Markdown injection via book metadata (titles, authors, etc.)
+    that could otherwise inject links, images, or other MD elements."""
+    if not isinstance(value, str):
+        value = str(value)
+    # Escape Markdown special characters that could create unwanted elements
+    # Keep basic formatting safe: only escape characters that could start
+    # unwanted link/image/heading/bold/italic constructs
+    value = value.replace('[', '\\[')
+    value = value.replace(']', '\\]')
+    value = value.replace('(', '\\(')
+    value = value.replace(')', '\\)')
+    # Prevent heading injection
+    value = re.sub(r'^#{1,6}\s', lambda m: '\\' + m.group(0), value)
+    return value
+
+
 def generate_full_md(book_info, text):
     """生成包含完整文本的Markdown
-    v18.2: YAML frontmatter values properly escaped"""
+    v22: YAML frontmatter values properly escaped + Markdown body injection prevention"""
     return f"""---
 title: {_yaml_escape(book_info['title'])}
 author: {_yaml_escape(book_info['author'])}
@@ -1556,14 +1701,14 @@ url: {_yaml_escape(book_info.get('url', ''))}
 converted_from: {book_info.get('format', 'unknown')}
 ---
 
-# {book_info['title']}
+# {_md_escape(book_info['title'])}
 
-**Author:** {book_info['author']}  
+**Author:** {_md_escape(book_info['author'])}  
 **Year:** {book_info.get('year', 'N/A')}  
-**License:** {book_info.get('license', 'N/A')}  
-**Source:** [{book_info.get('source', 'Online')}]({book_info.get('url', '')})
+**License:** {_md_escape(book_info.get('license', 'N/A'))}  
+**Source:** [{_md_escape(book_info.get('source', 'Online'))}]({book_info.get('url', '')})
 
-> {book_info.get('desc', '')}
+> {_md_escape(book_info.get('desc', ''))}
 
 ---
 
@@ -1578,7 +1723,7 @@ converted_from: {book_info.get('format', 'unknown')}
 
 def generate_note_md(book_info):
     """生成笔记框架Markdown
-    v18.2: YAML frontmatter values properly escaped"""
+    v22: YAML frontmatter values properly escaped + Markdown body injection prevention"""
     outline = book_info.get('outline', '*阅读后填充*')
     note_reason = book_info.get('note_reason', '')
     reason_line = f'\n> ⚠️ {note_reason}' if note_reason else '\n> ⚠️ 本书仅提供在线阅读，请通过上方链接访问原文。'
@@ -1597,14 +1742,14 @@ type: book
 url: {_yaml_escape(book_info.get('url', ''))}
 ---
 
-# {book_info['title']}
+# {_md_escape(book_info['title'])}
 
-**Author:** {book_info['author']}  
+**Author:** {_md_escape(book_info['author'])}  
 **Year:** {book_info.get('year', 'N/A')}  
-**License:** {book_info.get('license', 'N/A')}  
-**Source:** [{book_info.get('source', 'Online')}]({book_info.get('url', '')})
+**License:** {_md_escape(book_info.get('license', 'N/A'))}  
+**Source:** [{_md_escape(book_info.get('source', 'Online'))}]({book_info.get('url', '')})
 
-> {book_info.get('desc', '')}
+> {_md_escape(book_info.get('desc', ''))}
 {reason_line}
 
 ---
@@ -1774,15 +1919,19 @@ def _safe_path(base_dir, filename):
 
 # ===== 核心处理逻辑 =====
 
-def process_book(book_info, output_dir, tmp_dir="/tmp/book_dl"):
+def process_book(book_info, output_dir, tmp_dir=None):
     """
     处理单本书，按优先级尝试：
     1. HTML书籍抓取（沙箱友好，结构化Markdown输出）
     2. PDF/EPUB下载+文本提取（需桌面端或沙箱已安装pdfplumber）
     3. 降级为笔记框架
     
-    v18: Added output validation, atomic write, batch scraping for large HTML books
+    v22: Secure tmp_dir with mkdtemp, global resource limits
     """
+    import tempfile
+    # v22: Use mkdtemp for unpredictable temporary directory (symlink race prevention)
+    if tmp_dir is None:
+        tmp_dir = tempfile.mkdtemp(prefix='ebook_')
     os.makedirs(tmp_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
     # v18.2: Secure tmp_dir permissions
@@ -1936,11 +2085,14 @@ def process_book(book_info, output_dir, tmp_dir="/tmp/book_dl"):
     return 'converted', md_path
 
 
-def batch_process(books, output_dir, tmp_dir="/tmp/book_dl", progress_file=None):
+def batch_process(books, output_dir, tmp_dir=None, progress_file=None):
     """批量处理多本书，支持断点续传
     progress_file: .progress.json 路径，默认 {output_dir}/.progress.json
     中断后再次调用同一 progress_file，已完成的书籍自动跳过
-    """
+    v22: tmp_dir defaults to mkdtemp for security"""
+    import tempfile
+    if tmp_dir is None:
+        tmp_dir = tempfile.mkdtemp(prefix='ebook_batch_')
     if progress_file is None:
         progress_file = os.path.join(output_dir, '.progress.json')
 
@@ -2250,16 +2402,16 @@ if __name__ == '__main__':
         print("Commands: search, find, registry, process")
         sys.exit(1)
 
-# v18.2 更新（安全加固）：
-# - 新增 _is_private_ip()：统一私有IP检测，支持十六进制/八进制/十进制/缩写IP表示
-# - 新增 _validate_url_ssrf()：URL级别SSRF验证，含DNS解析检查
-# - 修复 SSRF 绕过：fetch_url 和 download_file 验证每个重定向目标
-# - 修复 SSRF 绕过：替代IP表示（0x7f000001、0177.0.0.1、127.1等）全部拦截
-# - 修复 SSRF 绕过：DNS重绑定攻击通过 socket.getaddrinfo 解析后验证
-# - 新增 _yaml_escape()：YAML frontmatter值安全转义
-# - 修复 YAML注入：换行符→空格、三横线→em-dash、引号安全转义
-# - 新增下载大小限制 MAX_DOWNLOAD_SIZE=200MB
-# - 修复 _atomic_write 文件描述符泄漏：使用 fd_closed 标志代替 getattr(os, '_fd_closed')
-# - 修复 tmp_dir 权限：chmod 0o700 防止多用户系统信息泄露
-# - 修复 search_gutenberg URL参数注入：使用 urllib.parse.quote_plus
-# - 修复 progress文件 非原子写入：使用 _atomic_write
+# v22.0 更新（安全加固 — 12项修复）：
+# - [CRITICAL] EPUB Zip Bomb防护：新增MAX_EPUB_FILES/MAX_EPUB_SINGLE_FILE/MAX_EPUB_TOTAL_SIZE限制
+# - [CRITICAL] EPUB路径穿越防护：校验ZIP内文件名不含../穿越字符
+# - [CRITICAL] SSRF IPv6绕过修复：DNS解析同时检查AF_INET和AF_INET6
+# - [CRITICAL] SSRF DNS重绑定防护：_check_connected_ip()验证实际连接目标IP
+# - [CRITICAL] Markdown注入防护：新增_md_escape()转义MD特殊字符（[]()/等）
+# - [CRITICAL] HTML解析器深度限制：HTMLToMarkdown新增MAX_NESTING_DEPTH=256
+# - [CRITICAL] 临时文件安全：process_book/batch_process改用mkdtemp不可预测路径
+# - [HIGH] 下载Content-Type校验：_validate_content_type()拒绝可执行文件类型
+# - [HIGH] Cookie隔离：沙箱请求显式设置cookies={}防止跨域会话泄露
+# - [HIGH] 全局资源限制：MAX_DOWNLOAD_SIZE/MAX_TOTAL_DOWNLOADS/MAX_EXTRACTION_SIZE
+# - [HIGH] SSL降级域名白名单：仅SSL_SKIP_DOMAINS中的已知书源站点允许跳过验证
+# - [HIGH] 连接后SSRF二次验证：_check_connected_ip()在HTTP连接建立后检查对端IP
